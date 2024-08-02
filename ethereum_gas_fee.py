@@ -1,6 +1,7 @@
 import os
 import requests
 import logging
+import argparse
 
 def get_ethereum_gas_fee(api_key):
     """
@@ -27,25 +28,34 @@ def get_ethereum_gas_fee(api_key):
             }
         else:
             logging.error(f"Failed to fetch gas fee data: {data['message']}")
-            raise Exception(f"Failed to fetch gas fee data: {data['message']}")
+            raise ValueError(f"Failed to fetch gas fee data: {data['message']}")
     except requests.exceptions.RequestException as e:
         logging.error(f"Request failed: {e}")
-        raise Exception(f"Request failed: {e}")
+        raise ConnectionError(f"Request failed: {e}")
+    except ValueError as e:
+        logging.error(f"Data error: {e}")
+        raise
     except Exception as e:
-        logging.error(f"An error occurred: {e}")
+        logging.error(f"An unexpected error occurred: {e}")
         raise
 
-def main():
-    api_key = os.getenv("ETHERSCAN_API_KEY") or "YourEtherscanAPIKey"
-    
+def main(api_key):
     try:
         gas_fees = get_ethereum_gas_fee(api_key)
-        print(f"Safe Gas Price: {gas_fees['SafeGasPrice']} Gwei")
-        print(f"Propose Gas Price: {gas_fees['ProposeGasPrice']} Gwei")
-        print(f"Fast Gas Price: {gas_fees['FastGasPrice']} Gwei")
+        logging.info(f"Safe Gas Price: {gas_fees['SafeGasPrice']} Gwei")
+        logging.info(f"Propose Gas Price: {gas_fees['ProposeGasPrice']} Gwei")
+        logging.info(f"Fast Gas Price: {gas_fees['FastGasPrice']} Gwei")
     except Exception as e:
-        print(e)
+        logging.error(e)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Fetch Ethereum gas fees using Etherscan API.')
+    parser.add_argument('--api_key', type=str, default=os.getenv("ETHERSCAN_API_KEY"), help='Etherscan API key')
+    
+    args = parser.parse_args()
+    
+    if not args.api_key:
+        raise ValueError("API key is required. Provide it via --api_key argument or ETHERSCAN_API_KEY environment variable.")
+    
     logging.basicConfig(level=logging.INFO)
-    main()
+    main(args.api_key)
