@@ -2,6 +2,8 @@ import os
 import requests
 import logging
 import argparse
+from requests.exceptions import Timeout, RequestException
+from retrying import retry
 
 def get_ethereum_gas_fee(api_key, timeout=10):
     """
@@ -27,7 +29,7 @@ def get_ethereum_gas_fee(api_key, timeout=10):
     try:
         logging.info("Sending request to Etherscan API...")
         response = requests.get(url, timeout=timeout)
-        response.raise_for_status()  # Will raise an HTTPError if the status is 4xx/5xx
+        response.raise_for_status()  # Will raise an HTTPError for 4xx/5xx statuses
         
         data = response.json()
         if data.get('status') == '1' and 'result' in data:
@@ -42,11 +44,11 @@ def get_ethereum_gas_fee(api_key, timeout=10):
             logging.error(f"Failed to fetch gas fee data: {error_message}")
             raise ValueError(f"Failed to fetch gas fee data: {error_message}")
     
-    except requests.exceptions.Timeout:
+    except Timeout:
         logging.error("Request to Etherscan API timed out.")
         raise ConnectionError("Request to Etherscan API timed out.")
     
-    except requests.exceptions.RequestException as e:
+    except RequestException as e:
         logging.error(f"Request to Etherscan API failed: {e}")
         raise ConnectionError(f"Request to Etherscan API failed: {e}")
     
@@ -58,9 +60,17 @@ def get_ethereum_gas_fee(api_key, timeout=10):
         logging.error(f"An unexpected error occurred: {e}")
         raise
 
+@retry(stop_max_attempt_number=3, wait_fixed=2000)
+def fetch_gas_fees_with_retry(api_key):
+    """
+    Wrapper around get_ethereum_gas_fee that implements a retry mechanism.
+    Retries up to 3 times with a 2-second delay between attempts.
+    """
+    return get_ethereum_gas_fee(api_key)
+
 def main(api_key):
     try:
-        gas_fees = get_ethereum_gas_fee(api_key)
+        gas_fees = fetch_gas_fees_with_retry(api_key)
         logging.info("Gas fees retrieved successfully:")
         logging.info(f"Safe Gas Price: {gas_fees['SafeGasPrice']} Gwei")
         logging.info(f"Proposed Gas Price: {gas_fees['ProposeGasPrice']} Gwei")
