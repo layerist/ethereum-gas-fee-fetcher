@@ -7,7 +7,7 @@ from retrying import retry
 
 def get_ethereum_gas_fee(api_key, timeout=10):
     """
-    Fetches the current Ethereum gas fee from Etherscan API.
+    Fetches the current Ethereum gas fee from the Etherscan API.
 
     Args:
         api_key (str): Etherscan API key.
@@ -29,7 +29,7 @@ def get_ethereum_gas_fee(api_key, timeout=10):
     try:
         logging.info("Sending request to Etherscan API...")
         response = requests.get(url, timeout=timeout)
-        response.raise_for_status()  # Will raise an HTTPError for 4xx/5xx statuses
+        response.raise_for_status()  # Raise HTTPError for 4xx/5xx statuses
         
         data = response.json()
         if data.get('status') == '1' and 'result' in data:
