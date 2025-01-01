@@ -8,10 +8,10 @@ from retrying import retry
 # Configure logging globally
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-def get_ethereum_gas_fee(api_key, timeout=10):
+def get_ethereum_gas_fee(api_key: str, timeout: int = 10) -> dict:
     """
     Fetches the current Ethereum gas fee from the Etherscan API.
 
@@ -33,7 +33,7 @@ def get_ethereum_gas_fee(api_key, timeout=10):
     params = {
         "module": "gastracker",
         "action": "gasoracle",
-        "apikey": api_key
+        "apikey": api_key,
     }
 
     try:
@@ -42,15 +42,15 @@ def get_ethereum_gas_fee(api_key, timeout=10):
         response.raise_for_status()
 
         data = response.json()
-        if data.get('status') == '1' and 'result' in data:
+        if data.get("status") == "1" and "result" in data:
             logging.info("Gas fee data fetched successfully.")
             return {
-                "SafeGasPrice": data['result']['SafeGasPrice'],       # Safe Gas Price (Gwei)
-                "ProposeGasPrice": data['result']['ProposeGasPrice'], # Proposed Gas Price (Gwei)
-                "FastGasPrice": data['result']['FastGasPrice']        # Fast Gas Price (Gwei)
+                "SafeGasPrice": data["result"]["SafeGasPrice"],  # Safe Gas Price (Gwei)
+                "ProposeGasPrice": data["result"]["ProposeGasPrice"],  # Proposed Gas Price (Gwei)
+                "FastGasPrice": data["result"]["FastGasPrice"],  # Fast Gas Price (Gwei)
             }
         else:
-            error_message = data.get('message', 'Unknown error')
+            error_message = data.get("message", "Unknown error")
             raise ValueError(f"Failed to fetch gas fee data: {error_message}")
 
     except Timeout:
@@ -60,12 +60,12 @@ def get_ethereum_gas_fee(api_key, timeout=10):
     except Exception as e:
         raise RuntimeError(f"An unexpected error occurred: {e}")
 
-@retry(stop_max_attempt_number=3, wait_fixed=2000)
-def fetch_gas_fees_with_retry(api_key, timeout=10):
+@retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=4000)
+def fetch_gas_fees_with_retry(api_key: str, timeout: int = 10) -> dict:
     """
     Wrapper around get_ethereum_gas_fee that implements a retry mechanism.
 
-    Retries up to 3 times with a 2-second delay between attempts.
+    Retries up to 3 times with exponential backoff.
 
     Args:
         api_key (str): Etherscan API key.
@@ -76,7 +76,7 @@ def fetch_gas_fees_with_retry(api_key, timeout=10):
     """
     return get_ethereum_gas_fee(api_key, timeout)
 
-def main(api_key):
+def main(api_key: str) -> None:
     """
     Main execution function to fetch and log Ethereum gas fees.
 
