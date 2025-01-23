@@ -5,7 +5,6 @@ import argparse
 from requests.exceptions import Timeout, RequestException
 from retrying import retry
 
-# Configure logging globally
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -45,9 +44,9 @@ def get_ethereum_gas_fee(api_key: str, timeout: int = 10) -> dict:
         if data.get("status") == "1" and "result" in data:
             logging.info("Gas fee data fetched successfully.")
             return {
-                "SafeGasPrice": data["result"]["SafeGasPrice"],  # Safe Gas Price (Gwei)
-                "ProposeGasPrice": data["result"]["ProposeGasPrice"],  # Proposed Gas Price (Gwei)
-                "FastGasPrice": data["result"]["FastGasPrice"],  # Fast Gas Price (Gwei)
+                "SafeGasPrice": data["result"]["SafeGasPrice"], 
+                "ProposeGasPrice": data["result"]["ProposeGasPrice"], 
+                "FastGasPrice": data["result"]["FastGasPrice"], 
             }
         else:
             error_message = data.get("message", "Unknown error")
@@ -108,7 +107,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Retrieve API key from either argument or environment variable
     api_key = args.api_key or os.getenv("ETHERSCAN_API_KEY")
 
     if not api_key:
