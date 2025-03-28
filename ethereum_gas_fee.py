@@ -2,7 +2,7 @@ import os
 import requests
 import logging
 import argparse
-from requests.exceptions import Timeout, RequestException
+from requests.exceptions import Timeout, RequestException, HTTPError
 from retrying import retry
 
 # Configure logging
@@ -11,9 +11,22 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-def get_ethereum_gas_fee(api_key: str, timeout: int = 10) -> dict:
+# Constants
+ETHERSCAN_API_URL = "https://api.etherscan.io/api"
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF = 1000  # 1 second base backoff
+RETRY_BACKOFF_MAX = 4000  # 4 seconds max backoff
+
+
+def validate_api_key(api_key: str) -> None:
+    """Validates the API key."""
+    if not api_key:
+        raise ValueError("Etherscan API key is required. Provide it via --api_key argument or ETHERSCAN_API_KEY environment variable.")
+
+
+def fetch_ethereum_gas_fees(api_key: str, timeout: int = 10) -> dict:
     """
-    Fetches the current Ethereum gas fees from the Etherscan API.
+    Fetches the current Ethereum gas fees from Etherscan.
 
     Args:
         api_key (str): Etherscan API key.
@@ -23,13 +36,12 @@ def get_ethereum_gas_fee(api_key: str, timeout: int = 10) -> dict:
         dict: Dictionary containing Safe, Proposed, and Fast gas prices in Gwei.
 
     Raises:
-        ValueError: If the API key is invalid or response is not successful.
+        ValueError: If the API key is invalid or response is unsuccessful.
         ConnectionError: If the request fails due to network issues.
+        RuntimeError: For unexpected errors.
     """
-    if not api_key:
-        raise ValueError("API key is required to fetch gas fees.")
+    validate_api_key(api_key)
 
-    url = "https://api.etherscan.io/api"
     params = {
         "module": "gastracker",
         "action": "gasoracle",
@@ -38,8 +50,8 @@ def get_ethereum_gas_fee(api_key: str, timeout: int = 10) -> dict:
 
     try:
         logging.info("Fetching Ethereum gas fees from Etherscan...")
-        response = requests.get(url, params=params, timeout=timeout)
-        response.raise_for_status()
+        response = requests.get(ETHERSCAN_API_URL, params=params, timeout=timeout)
+        response.raise_for_status()  # Raise exception for HTTP errors
         data = response.json()
 
         if data.get("status") == "1" and "result" in data:
@@ -53,17 +65,20 @@ def get_ethereum_gas_fee(api_key: str, timeout: int = 10) -> dict:
 
     except Timeout:
         raise ConnectionError("Request to Etherscan API timed out.")
+    except HTTPError as e:
+        raise ConnectionError(f"HTTP error occurred: {e}")
     except RequestException as e:
-        raise ConnectionError(f"API request error: {e}")
+        raise ConnectionError(f"API request failed: {e}")
     except Exception as e:
         raise RuntimeError(f"Unexpected error: {e}")
 
-@retry(stop_max_attempt_number=3, wait_exponential_multiplier=1000, wait_exponential_max=4000)
+
+@retry(stop_max_attempt_number=RETRY_ATTEMPTS, wait_exponential_multiplier=RETRY_BACKOFF, wait_exponential_max=RETRY_BACKOFF_MAX)
 def fetch_gas_fees_with_retry(api_key: str, timeout: int = 10) -> dict:
     """
-    Fetches Ethereum gas fees with automatic retry in case of failure.
+    Fetches Ethereum gas fees with automatic retries in case of failure.
 
-    Retries up to 3 times with exponential backoff (1s, 2s, 4s between retries).
+    Retries up to RETRY_ATTEMPTS times with exponential backoff.
 
     Args:
         api_key (str): Etherscan API key.
@@ -72,7 +87,10 @@ def fetch_gas_fees_with_retry(api_key: str, timeout: int = 10) -> dict:
     Returns:
         dict: Gas fees retrieved from the API.
     """
-    return get_ethereum_gas_fee(api_key, timeout)
+    attempt = fetch_gas_fees_with_retry.retry.statistics.get("attempt_number", 1)
+    logging.info(f"Attempt {attempt}/{RETRY_ATTEMPTS} to fetch gas fees...")
+    return fetch_ethereum_gas_fees(api_key, timeout)
+
 
 def main(api_key: str) -> None:
     """
@@ -91,6 +109,7 @@ def main(api_key: str) -> None:
         logging.error(e)
     except Exception as e:
         logging.error(f"Unhandled exception: {e}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch Ethereum gas fees from Etherscan API.")
