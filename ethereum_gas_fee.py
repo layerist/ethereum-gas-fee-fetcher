@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import logging
 import argparse
@@ -17,11 +18,10 @@ DEFAULT_BACKOFF_MAX = 4
 
 def configure_logger(verbose: bool = False) -> logging.Logger:
     logger = logging.getLogger("etherscan_gas_tracker")
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-
-    if not logger.hasHandlers():
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        handler.setFormatter(formatter)
         logger.addHandler(handler)
 
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -47,37 +47,44 @@ def parse_gas_data(response: dict) -> Dict[str, str]:
     }
 
 
-@retry(
-    stop=stop_after_attempt(DEFAULT_RETRIES),
-    wait=wait_exponential(multiplier=DEFAULT_BACKOFF_BASE, max=DEFAULT_BACKOFF_MAX),
-    reraise=True
-)
-def fetch_gas_data(api_key: str, timeout: int, logger: logging.Logger) -> Dict[str, str]:
-    params = {
-        "module": "gastracker",
-        "action": "gasoracle",
-        "apikey": api_key
-    }
+def build_retry(retries: int, backoff_base: int, backoff_max: int, logger: logging.Logger):
+    return retry(
+        stop=stop_after_attempt(retries),
+        wait=wait_exponential(multiplier=backoff_base, max=backoff_max),
+        before=before_log(logger, logging.WARNING),
+        reraise=True
+    )
 
-    try:
-        logger.debug("Sending request to Etherscan Gas Oracle API...")
-        response = requests.get(ETHERSCAN_API_URL, params=params, timeout=timeout)
-        response.raise_for_status()
-        data = response.json()
-        logger.debug(f"Raw API response: {data}")
-        return parse_gas_data(data)
-    except Timeout:
-        logger.warning("Request timed out.")
-        raise
-    except HTTPError as e:
-        logger.error(f"HTTP {e.response.status_code} error: {e}")
-        raise
-    except RequestException as e:
-        logger.error(f"Network error: {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise
+
+def make_fetch_function(retries: int, backoff_base: int, backoff_max: int, logger: logging.Logger):
+    @build_retry(retries, backoff_base, backoff_max, logger)
+    def _fetch(api_key: str, timeout: int) -> Dict[str, str]:
+        params = {
+            "module": "gastracker",
+            "action": "gasoracle",
+            "apikey": api_key
+        }
+        try:
+            logger.debug("Sending request to Etherscan Gas Oracle API...")
+            response = requests.get(ETHERSCAN_API_URL, params=params, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            logger.debug(f"Raw API response: {data}")
+            return parse_gas_data(data)
+        except Timeout:
+            logger.warning("Request timed out.")
+            raise
+        except HTTPError as e:
+            logger.error(f"HTTP {e.response.status_code} error: {e}")
+            raise
+        except RequestException as e:
+            logger.error(f"Network error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            raise
+
+    return _fetch
 
 
 def display_gas_prices(fees: Dict[str, str], json_output: bool) -> None:
@@ -102,19 +109,18 @@ def main(
 
     try:
         api_key = get_api_key(api_key)
-
-        # Dynamically patch retry config
-        fetch_gas_data.retry.stop = stop_after_attempt(retries)
-        fetch_gas_data.retry.wait = wait_exponential(multiplier=backoff_base, max=backoff_max)
-        fetch_gas_data.retry.before = before_log(logger, logging.WARNING)
+        fetch_gas_data = make_fetch_function(retries, backoff_base, backoff_max, logger)
 
         logger.info("Fetching gas prices from Etherscan...")
-        fees = fetch_gas_data(api_key, timeout, logger)
+        fees = fetch_gas_data(api_key, timeout)
         display_gas_prices(fees, json_output)
+
     except RetryError as e:
         logger.error(f"Failed after {retries} attempts: {e.last_attempt.exception()}")
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
