@@ -1,198 +1,222 @@
 #!/usr/bin/env python3
 """
-Improved Etherscan Gas Tracker
-------------------------------
+Etherscan Gas Tracker
+--------------------
 Fetches and displays Ethereum gas prices using the Etherscan API.
 
-Enhancements:
-- Cleaner architecture and reduced duplication
-- Robust logging without duplicate handlers
-- More explicit error handling
-- Polished retry logic
-- Cleaner CLI and output formatting
+Features:
+- Clean, testable architecture
+- Explicit configuration via dataclass
+- Robust retry logic for transient failures
+- Structured logging without duplicate handlers
+- JSON or human-readable output
 """
+
+from __future__ import annotations
 
 import os
 import sys
 import json
 import logging
 import argparse
-from typing import Dict, Optional, Any, Callable
+from dataclasses import dataclass
+from typing import Dict, Optional, Any
 
 import requests
 from requests.exceptions import Timeout, RequestException, HTTPError
-from tenacity import retry, stop_after_attempt, wait_exponential, before_log, RetryError
+from tenacity import retry, stop_after_attempt, wait_exponential, before_log, retry_if_exception_type, RetryError
 
 
-# === Constants ===
+# === Constants ===============================================================
+
 ETHERSCAN_API_URL = "https://api.etherscan.io/api"
+MODULE = "gastracker"
+ACTION = "gasoracle"
+
 DEFAULT_TIMEOUT = 10
 DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF_BASE = 1
 DEFAULT_BACKOFF_MAX = 4
-MODULE = "gastracker"
-ACTION = "gasoracle"
 
-BASE_PARAMS = {"module": MODULE, "action": ACTION}
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_INTERRUPT = 130
 
 
-# === Logger ===
-def configure_logger(verbose: bool = False) -> logging.Logger:
-    """Configure and return logger instance."""
+# === Configuration ===========================================================
+
+@dataclass(frozen=True)
+class AppConfig:
+    api_key: str
+    timeout: int
+    retries: int
+    backoff_base: int
+    backoff_max: int
+    json_output: bool
+    verbose: bool
+
+
+# === Logging ================================================================
+
+def configure_logger(verbose: bool) -> logging.Logger:
     logger = logging.getLogger("etherscan_gas_tracker")
 
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter(
             "%(asctime)s | %(levelname)-8s | %(message)s",
-            "%H:%M:%S"
+            "%H:%M:%S",
         ))
         logger.addHandler(handler)
 
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    logger.propagate = False
     return logger
 
 
-# === API Key ===
-def get_api_key(provided_key: Optional[str]) -> str:
-    """Return API key from CLI or environment."""
-    key = provided_key or os.getenv("ETHERSCAN_API_KEY")
+# === Utilities ==============================================================
+
+def resolve_api_key(cli_key: Optional[str]) -> str:
+    key = cli_key or os.getenv("ETHERSCAN_API_KEY")
     if not key:
-        raise ValueError("Missing API key. Use --api_key or set ETHERSCAN_API_KEY.")
+        raise ValueError("Etherscan API key is missing (CLI or ETHERSCAN_API_KEY).")
     return key
 
 
-# === Response Parsing ===
-def parse_gas_data(response: Dict[str, Any]) -> Dict[str, str]:
-    """Extract gas data or raise readable exception."""
-    if response.get("status") != "1" or "result" not in response:
-        raise ValueError(f"Etherscan API error: {response.get('message', 'Unknown error')}")
+def parse_gas_response(payload: Dict[str, Any]) -> Dict[str, str]:
+    if payload.get("status") != "1":
+        message = payload.get("message", "Unknown error")
+        result = payload.get("result", "")
+        raise ValueError(f"Etherscan API error: {message} ({result})")
 
-    r = response["result"]
+    result = payload["result"]
     return {
-        "SafeGasPrice": r.get("SafeGasPrice", "N/A"),
-        "ProposeGasPrice": r.get("ProposeGasPrice", "N/A"),
-        "FastGasPrice": r.get("FastGasPrice", "N/A"),
-        "BaseFee": r.get("suggestBaseFee", "N/A"),
-        "LastBlock": r.get("LastBlock", "N/A"),
+        "SafeGasPrice": result.get("SafeGasPrice", "N/A"),
+        "ProposeGasPrice": result.get("ProposeGasPrice", "N/A"),
+        "FastGasPrice": result.get("FastGasPrice", "N/A"),
+        "BaseFee": result.get("suggestBaseFee", "N/A"),
+        "LastBlock": result.get("LastBlock", "N/A"),
     }
 
 
-# === Retry Decorator Factory ===
-def retry_decorator(retries: int, backoff_base: int, backoff_max: int, logger: logging.Logger):
-    """Create a retry decorator for network operations."""
+# === Networking =============================================================
+
+def retry_policy(logger: logging.Logger, retries: int, base: int, max_wait: int):
     return retry(
         stop=stop_after_attempt(retries),
-        wait=wait_exponential(multiplier=backoff_base, max=backoff_max),
+        wait=wait_exponential(multiplier=base, max=max_wait),
+        retry=retry_if_exception_type((Timeout, RequestException)),
         before=before_log(logger, logging.WARNING),
         reraise=True,
     )
 
 
-# === Fetcher Factory ===
-def make_fetcher(
+def fetch_gas_prices(
     session: requests.Session,
-    retries: int,
-    backoff_base: int,
-    backoff_max: int,
+    config: AppConfig,
     logger: logging.Logger,
-) -> Callable[[str, int], Dict[str, str]]:
+) -> Dict[str, str]:
 
-    @retry_decorator(retries, backoff_base, backoff_max, logger)
-    def _fetch(api_key: str, timeout: int) -> Dict[str, str]:
-        params = {**BASE_PARAMS, "apikey": api_key}
-        logger.debug(f"Fetching gas prices with params: {params}")
+    @retry_policy(logger, config.retries, config.backoff_base, config.backoff_max)
+    def _request() -> Dict[str, str]:
+        params = {
+            "module": MODULE,
+            "action": ACTION,
+            "apikey": config.api_key,
+        }
+
+        logger.debug("Request params: %s", params)
+
+        response = session.get(
+            ETHERSCAN_API_URL,
+            params=params,
+            timeout=config.timeout,
+        )
+        response.raise_for_status()
 
         try:
-            resp = session.get(ETHERSCAN_API_URL, params=params, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.json()
-        except Timeout:
-            logger.warning("Request timed out.")
-            raise
-        except HTTPError as e:
-            logger.error(f"HTTP {e.response.status_code}: {e}")
-            raise
-        except RequestException as e:
-            logger.error(f"Network error: {e}")
-            raise
-        except ValueError:
-            logger.error("Invalid JSON from Etherscan.")
-            raise
+            data = response.json()
+        except ValueError as e:
+            raise ValueError("Invalid JSON received from Etherscan") from e
 
-        logger.debug(f"API raw response: {data}")
-        return parse_gas_data(data)
+        logger.debug("Raw API response: %s", data)
+        return parse_gas_response(data)
 
-    return _fetch
+    return _request()
 
 
-# === Output ===
-def display(fees: Dict[str, str], json_output: bool, logger: logging.Logger):
+# === Output =================================================================
+
+def render_output(data: Dict[str, str], json_output: bool, logger: logging.Logger) -> None:
     if json_output:
-        print(json.dumps(fees, indent=2))
+        print(json.dumps(data, indent=2))
         return
 
-    logger.info("\nEthereum Gas Prices (Gwei):")
-    for k, v in fees.items():
-        logger.info(f"  {k:<14}: {v}")
+    logger.info("Ethereum Gas Prices (Gwei)")
+    for key, value in data.items():
+        logger.info("  %-14s : %s", key, value)
 
 
-# === Main ===
-def main(
-    api_key: Optional[str],
-    verbose: bool,
-    timeout: int,
-    retries: int,
-    backoff_base: int,
-    backoff_max: int,
-    json_output: bool,
-):
-    logger = configure_logger(verbose)
+# === Main ===================================================================
+
+def run(config: AppConfig) -> int:
+    logger = configure_logger(config.verbose)
 
     try:
-        api_key = get_api_key(api_key)
-        session = requests.Session()
-        session.headers["User-Agent"] = "EtherscanGasTracker/1.1"
+        logger.info("Fetching Ethereum gas prices...")
 
-        fetch = make_fetcher(session, retries, backoff_base, backoff_max, logger)
+        with requests.Session() as session:
+            session.headers["User-Agent"] = "EtherscanGasTracker/1.2"
+            prices = fetch_gas_prices(session, config, logger)
 
-        logger.info("Requesting Ethereum gas prices...")
-        fees = fetch(api_key, timeout)
-        display(fees, json_output, logger)
+        render_output(prices, config.json_output, logger)
+        return EXIT_OK
 
     except RetryError as e:
-        logger.error(f"Failed after {retries} retries: {e.last_attempt.exception()}")
-        sys.exit(1)
+        logger.error("Request failed after %d retries: %s", config.retries, e.last_attempt.exception())
+        return EXIT_ERROR
+
     except KeyboardInterrupt:
         logger.warning("Interrupted by user.")
-        sys.exit(130)
+        return EXIT_INTERRUPT
+
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+        logger.error("Fatal error: %s", e)
+        return EXIT_ERROR
 
 
-# === CLI ===
-def cli():
-    parser = argparse.ArgumentParser(description="Fetch Ethereum gas prices from Etherscan.")
-    parser.add_argument("--api_key", help="Provide Etherscan API key or set env ETHERSCAN_API_KEY")
+# === CLI ====================================================================
+
+def cli() -> None:
+    parser = argparse.ArgumentParser(
+        description="Fetch Ethereum gas prices from Etherscan.",
+    )
+
+    parser.add_argument("--api_key", help="Etherscan API key (or env ETHERSCAN_API_KEY)")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Request timeout (seconds)")
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Retry attempts")
+    parser.add_argument("--backoff_base", type=int, default=DEFAULT_BACKOFF_BASE, help="Backoff base multiplier")
+    parser.add_argument("--backoff_max", type=int, default=DEFAULT_BACKOFF_MAX, help="Max backoff delay (seconds)")
+    parser.add_argument("--json", action="store_true", help="Output raw JSON")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Request timeout (s)")
-    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
-    parser.add_argument("--backoff_base", type=int, default=DEFAULT_BACKOFF_BASE)
-    parser.add_argument("--backoff_max", type=int, default=DEFAULT_BACKOFF_MAX)
-    parser.add_argument("--json", action="store_true", help="Output JSON")
 
     args = parser.parse_args()
 
-    main(
-        api_key=args.api_key,
-        verbose=args.verbose,
-        timeout=args.timeout,
-        retries=args.retries,
-        backoff_base=args.backoff_base,
-        backoff_max=args.backoff_max,
-        json_output=args.json,
-    )
+    try:
+        config = AppConfig(
+            api_key=resolve_api_key(args.api_key),
+            timeout=args.timeout,
+            retries=args.retries,
+            backoff_base=args.backoff_base,
+            backoff_max=args.backoff_max,
+            json_output=args.json,
+            verbose=args.verbose,
+        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(EXIT_ERROR)
+
+    sys.exit(run(config))
 
 
 if __name__ == "__main__":
