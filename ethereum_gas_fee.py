@@ -20,7 +20,7 @@ import json
 import logging
 import argparse
 from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TypedDict
 
 import requests
 from requests import Session
@@ -33,7 +33,6 @@ from tenacity import (
     retry_if_exception,
     RetryError,
 )
-
 
 # =============================================================================
 # Constants
@@ -48,10 +47,22 @@ DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF_BASE = 1
 DEFAULT_BACKOFF_MAX = 4
 
+USER_AGENT = "EtherscanGasTracker/1.4"
+
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_INTERRUPT = 130
 
+# =============================================================================
+# Types
+# =============================================================================
+
+class GasPrices(TypedDict):
+    SafeGasPrice: str
+    ProposeGasPrice: str
+    FastGasPrice: str
+    BaseFee: str
+    LastBlock: str
 
 # =============================================================================
 # Configuration
@@ -66,7 +77,6 @@ class AppConfig:
     backoff_max: int = DEFAULT_BACKOFF_MAX
     json_output: bool = False
     verbose: bool = False
-
 
 # =============================================================================
 # Logging
@@ -89,7 +99,6 @@ def configure_logger(verbose: bool) -> logging.Logger:
     logger.propagate = False
     return logger
 
-
 # =============================================================================
 # Utilities
 # =============================================================================
@@ -97,42 +106,53 @@ def configure_logger(verbose: bool) -> logging.Logger:
 def resolve_api_key(cli_key: Optional[str]) -> str:
     api_key = cli_key or os.getenv("ETHERSCAN_API_KEY")
     if not api_key:
-        raise ValueError("Etherscan API key is missing (CLI or ETHERSCAN_API_KEY).")
+        raise ValueError(
+            "Missing Etherscan API key. "
+            "Use --api-key or set ETHERSCAN_API_KEY."
+        )
     return api_key
 
 
 def is_retryable_exception(exc: Exception) -> bool:
     if isinstance(exc, Timeout):
         return True
+
     if isinstance(exc, HTTPError):
-        # Retry only on 5xx
         return exc.response is not None and exc.response.status_code >= 500
+
     return isinstance(exc, RequestException)
 
 
-def parse_gas_response(payload: Dict[str, Any]) -> Dict[str, str]:
+def parse_gas_response(payload: Dict[str, Any]) -> GasPrices:
     if payload.get("status") != "1":
         raise ValueError(
             f"Etherscan API error: {payload.get('message')} "
             f"({payload.get('result')})"
         )
 
-    result = payload.get("result", {})
-    return {
-        "SafeGasPrice": result.get("SafeGasPrice", "N/A"),
-        "ProposeGasPrice": result.get("ProposeGasPrice", "N/A"),
-        "FastGasPrice": result.get("FastGasPrice", "N/A"),
-        "BaseFee": result.get("suggestBaseFee", "N/A"),
-        "LastBlock": result.get("LastBlock", "N/A"),
-    }
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise ValueError("Malformed API response: 'result' is not an object")
 
+    return {
+        "SafeGasPrice": str(result.get("SafeGasPrice", "N/A")),
+        "ProposeGasPrice": str(result.get("ProposeGasPrice", "N/A")),
+        "FastGasPrice": str(result.get("FastGasPrice", "N/A")),
+        "BaseFee": str(result.get("suggestBaseFee", "N/A")),
+        "LastBlock": str(result.get("LastBlock", "N/A")),
+    }
 
 # =============================================================================
 # Etherscan Client
 # =============================================================================
 
 class EtherscanClient:
-    def __init__(self, session: Session, config: AppConfig, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        session: Session,
+        config: AppConfig,
+        logger: logging.Logger,
+    ) -> None:
         self.session = session
         self.config = config
         self.logger = logger
@@ -156,9 +176,9 @@ class EtherscanClient:
             reraise=True,
         )
 
-    def fetch_gas_prices(self) -> Dict[str, str]:
+    def fetch_gas_prices(self) -> GasPrices:
         @self._retry_policy()
-        def _request() -> Dict[str, str]:
+        def _request() -> GasPrices:
             self.logger.debug("Request params: %s", self._params())
 
             response = self.session.get(
@@ -178,12 +198,11 @@ class EtherscanClient:
 
         return _request()
 
-
 # =============================================================================
 # Output
 # =============================================================================
 
-def render_output(data: Dict[str, str], json_output: bool, logger: logging.Logger) -> None:
+def render_output(data: GasPrices, json_output: bool, logger: logging.Logger) -> None:
     if json_output:
         print(json.dumps(data, indent=2))
         return
@@ -191,7 +210,6 @@ def render_output(data: Dict[str, str], json_output: bool, logger: logging.Logge
     logger.info("Ethereum Gas Prices (Gwei)")
     for key, value in data.items():
         logger.info("  %-16s : %s", key, value)
-
 
 # =============================================================================
 # Main Execution
@@ -204,10 +222,12 @@ def run(config: AppConfig) -> int:
         logger.info("Fetching Ethereum gas prices...")
 
         with requests.Session() as session:
-            session.headers.update({
-                "User-Agent": "EtherscanGasTracker/1.3",
-                "Accept": "application/json",
-            })
+            session.headers.update(
+                {
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/json",
+                }
+            )
 
             client = EtherscanClient(session, config, logger)
             prices = client.fetch_gas_prices()
@@ -231,7 +251,6 @@ def run(config: AppConfig) -> int:
         logger.error("Fatal error: %s", exc)
         return EXIT_ERROR
 
-
 # =============================================================================
 # CLI
 # =============================================================================
@@ -254,10 +273,10 @@ def cli() -> None:
     try:
         config = AppConfig(
             api_key=resolve_api_key(args.api_key),
-            timeout=args.timeout,
-            retries=args.retries,
-            backoff_base=args.backoff_base,
-            backoff_max=args.backoff_max,
+            timeout=max(1, args.timeout),
+            retries=max(1, args.retries),
+            backoff_base=max(1, args.backoff_base),
+            backoff_max=max(1, args.backoff_max),
             json_output=args.json,
             verbose=args.verbose,
         )
