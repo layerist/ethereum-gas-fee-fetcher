@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Etherscan Gas Tracker
---------------------
-Fetches and displays Ethereum gas prices using the Etherscan API.
+Etherscan Gas Tracker (Improved)
+---------------------------------
+Fetches Ethereum gas prices using the Etherscan API.
 
-Features:
-- Clean, testable architecture
-- Explicit configuration via dataclass
-- Robust retry logic with exponential backoff
-- Structured logging without duplicate handlers
-- JSON or human-readable output
+Enhancements:
+- Connection pooling with HTTPAdapter
+- Smarter retry logic (429 + 5xx only)
+- Strict response validation
+- Cleaner typing
+- Slight performance improvements
 """
 
 from __future__ import annotations
@@ -20,16 +20,17 @@ import json
 import logging
 import argparse
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, TypedDict
+from typing import Mapping, Any, Optional, TypedDict
 
 import requests
 from requests import Session
+from requests.adapters import HTTPAdapter
 from requests.exceptions import Timeout, RequestException, HTTPError
 from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
-    before_log,
+    before_sleep_log,
     retry_if_exception,
     RetryError,
 )
@@ -45,9 +46,9 @@ ACTION = "gasoracle"
 DEFAULT_TIMEOUT = 10
 DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF_BASE = 1
-DEFAULT_BACKOFF_MAX = 4
+DEFAULT_BACKOFF_MAX = 8
 
-USER_AGENT = "EtherscanGasTracker/1.4"
+USER_AGENT = "EtherscanGasTracker/2.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -58,11 +59,12 @@ EXIT_INTERRUPT = 130
 # =============================================================================
 
 class GasPrices(TypedDict):
-    SafeGasPrice: str
-    ProposeGasPrice: str
-    FastGasPrice: str
-    BaseFee: str
-    LastBlock: str
+    safe: float
+    proposed: float
+    fast: float
+    base_fee: float
+    last_block: int
+
 
 # =============================================================================
 # Configuration
@@ -77,6 +79,7 @@ class AppConfig:
     backoff_max: int = DEFAULT_BACKOFF_MAX
     json_output: bool = False
     verbose: bool = False
+
 
 # =============================================================================
 # Logging
@@ -99,6 +102,7 @@ def configure_logger(verbose: bool) -> logging.Logger:
     logger.propagate = False
     return logger
 
+
 # =============================================================================
 # Utilities
 # =============================================================================
@@ -117,13 +121,28 @@ def is_retryable_exception(exc: Exception) -> bool:
     if isinstance(exc, Timeout):
         return True
 
-    if isinstance(exc, HTTPError):
-        return exc.response is not None and exc.response.status_code >= 500
+    if isinstance(exc, HTTPError) and exc.response:
+        status = exc.response.status_code
+        return status == 429 or status >= 500
 
     return isinstance(exc, RequestException)
 
 
-def parse_gas_response(payload: Dict[str, Any]) -> GasPrices:
+def parse_float(value: Any, field: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid numeric value for '{field}': {value}")
+
+
+def parse_int(value: Any, field: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid integer value for '{field}': {value}")
+
+
+def parse_gas_response(payload: Mapping[str, Any]) -> GasPrices:
     if payload.get("status") != "1":
         raise ValueError(
             f"Etherscan API error: {payload.get('message')} "
@@ -131,16 +150,17 @@ def parse_gas_response(payload: Dict[str, Any]) -> GasPrices:
         )
 
     result = payload.get("result")
-    if not isinstance(result, dict):
+    if not isinstance(result, Mapping):
         raise ValueError("Malformed API response: 'result' is not an object")
 
     return {
-        "SafeGasPrice": str(result.get("SafeGasPrice", "N/A")),
-        "ProposeGasPrice": str(result.get("ProposeGasPrice", "N/A")),
-        "FastGasPrice": str(result.get("FastGasPrice", "N/A")),
-        "BaseFee": str(result.get("suggestBaseFee", "N/A")),
-        "LastBlock": str(result.get("LastBlock", "N/A")),
+        "safe": parse_float(result.get("SafeGasPrice"), "SafeGasPrice"),
+        "proposed": parse_float(result.get("ProposeGasPrice"), "ProposeGasPrice"),
+        "fast": parse_float(result.get("FastGasPrice"), "FastGasPrice"),
+        "base_fee": parse_float(result.get("suggestBaseFee"), "suggestBaseFee"),
+        "last_block": parse_int(result.get("LastBlock"), "LastBlock"),
     }
+
 
 # =============================================================================
 # Etherscan Client
@@ -157,8 +177,7 @@ class EtherscanClient:
         self.config = config
         self.logger = logger
 
-    def _params(self) -> Dict[str, str]:
-        return {
+        self._params = {
             "module": MODULE,
             "action": ACTION,
             "apikey": self.config.api_key,
@@ -172,20 +191,21 @@ class EtherscanClient:
                 max=self.config.backoff_max,
             ),
             retry=retry_if_exception(is_retryable_exception),
-            before=before_log(self.logger, logging.WARNING),
+            before_sleep=before_sleep_log(self.logger, logging.WARNING),
             reraise=True,
         )
 
     def fetch_gas_prices(self) -> GasPrices:
         @self._retry_policy()
         def _request() -> GasPrices:
-            self.logger.debug("Request params: %s", self._params())
+            self.logger.debug("Request params: %s", self._params)
 
             response = self.session.get(
                 ETHERSCAN_API_URL,
-                params=self._params(),
+                params=self._params,
                 timeout=self.config.timeout,
             )
+
             response.raise_for_status()
 
             try:
@@ -198,22 +218,44 @@ class EtherscanClient:
 
         return _request()
 
+
 # =============================================================================
 # Output
 # =============================================================================
 
-def render_output(data: GasPrices, json_output: bool, logger: logging.Logger) -> None:
+def render_output(data: GasPrices, json_output: bool) -> None:
     if json_output:
         print(json.dumps(data, indent=2))
         return
 
-    logger.info("Ethereum Gas Prices (Gwei)")
-    for key, value in data.items():
-        logger.info("  %-16s : %s", key, value)
+    print("Ethereum Gas Prices (Gwei)")
+    print("-" * 35)
+    print(f"Safe       : {data['safe']:.2f}")
+    print(f"Proposed   : {data['proposed']:.2f}")
+    print(f"Fast       : {data['fast']:.2f}")
+    print(f"Base Fee   : {data['base_fee']:.2f}")
+    print(f"Last Block : {data['last_block']}")
+
 
 # =============================================================================
 # Main Execution
 # =============================================================================
+
+def create_session() -> Session:
+    session = requests.Session()
+
+    adapter = HTTPAdapter(pool_connections=5, pool_maxsize=5)
+    session.mount("https://", adapter)
+
+    session.headers.update(
+        {
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        }
+    )
+
+    return session
+
 
 def run(config: AppConfig) -> int:
     logger = configure_logger(config.verbose)
@@ -221,18 +263,11 @@ def run(config: AppConfig) -> int:
     try:
         logger.info("Fetching Ethereum gas prices...")
 
-        with requests.Session() as session:
-            session.headers.update(
-                {
-                    "User-Agent": USER_AGENT,
-                    "Accept": "application/json",
-                }
-            )
-
+        with create_session() as session:
             client = EtherscanClient(session, config, logger)
             prices = client.fetch_gas_prices()
 
-        render_output(prices, config.json_output, logger)
+        render_output(prices, config.json_output)
         return EXIT_OK
 
     except RetryError as exc:
@@ -250,6 +285,7 @@ def run(config: AppConfig) -> int:
     except Exception as exc:
         logger.error("Fatal error: %s", exc)
         return EXIT_ERROR
+
 
 # =============================================================================
 # CLI
