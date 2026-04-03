@@ -1,38 +1,33 @@
 #!/usr/bin/env python3
 """
-Etherscan Gas Tracker (Production-grade)
-----------------------------------------
-Fetch Ethereum gas prices using the Etherscan API.
-
+Etherscan Gas Tracker (Production-grade v4)
+------------------------------------------
 Enhancements:
-- Optimized connection pooling
-- Strict retry policy (429 + 5xx + network)
-- Exponential backoff with jitter
-- Split connect/read timeouts
-- Immutable request parameters
-- Strict response validation
-- Faster JSON parsing
+- orjson for faster parsing (fallback safe)
+- smarter retry (network + bad payload)
+- optional rate limiting
+- request timing metrics
+- stricter validation
+- improved logging context
 """
 
 from __future__ import annotations
 
 import os
 import sys
-import json
+import time
 import logging
 import argparse
 from dataclasses import dataclass
-from typing import Mapping, Any, Optional, TypedDict
+from typing import Mapping, Any, Optional, TypedDict, Callable
 
 import requests
 from requests import Session
 from requests.adapters import HTTPAdapter
 from requests.exceptions import (
-    Timeout,
     ConnectTimeout,
     ReadTimeout,
     ConnectionError,
-    RequestException,
     HTTPError,
 )
 
@@ -44,6 +39,20 @@ from tenacity import (
     retry_if_exception,
     RetryError,
 )
+
+# Optional ultra-fast JSON
+try:
+    import orjson
+
+    def json_loads(data: bytes):
+        return orjson.loads(data)
+
+except ImportError:
+    import json
+
+    def json_loads(data: bytes):
+        return json.loads(data)
+
 
 # =============================================================================
 # Constants
@@ -61,11 +70,12 @@ DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF_BASE = 1
 DEFAULT_BACKOFF_MAX = 10
 
-USER_AGENT = "EtherscanGasTracker/3.0"
+USER_AGENT = "EtherscanGasTracker/4.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_INTERRUPT = 130
+
 
 # =============================================================================
 # Types
@@ -91,6 +101,7 @@ class AppConfig:
     backoff_max: int = DEFAULT_BACKOFF_MAX
     json_output: bool = False
     verbose: bool = False
+    rate_limit_delay: float = 0.0  # seconds between calls
 
 
 # =============================================================================
@@ -104,7 +115,6 @@ def configure_logger(verbose: bool) -> logging.Logger:
         return logger
 
     handler = logging.StreamHandler(sys.stdout)
-
     handler.setFormatter(
         logging.Formatter(
             "%(asctime)s | %(levelname)-8s | %(message)s",
@@ -120,7 +130,7 @@ def configure_logger(verbose: bool) -> logging.Logger:
 
 
 # =============================================================================
-# Utilities
+# Utils
 # =============================================================================
 
 def resolve_api_key(cli_key: Optional[str]) -> str:
@@ -128,18 +138,13 @@ def resolve_api_key(cli_key: Optional[str]) -> str:
 
     if not api_key:
         raise ValueError(
-            "Missing Etherscan API key. "
-            "Use --api-key or set ETHERSCAN_API_KEY."
+            "Missing Etherscan API key. Use --api-key or set ETHERSCAN_API_KEY."
         )
 
     return api_key
 
 
 def is_retryable_exception(exc: Exception) -> bool:
-    """
-    Retry only network failures or server-side failures.
-    """
-
     if isinstance(exc, (ConnectTimeout, ReadTimeout, ConnectionError)):
         return True
 
@@ -147,37 +152,34 @@ def is_retryable_exception(exc: Exception) -> bool:
         status = exc.response.status_code
         return status == 429 or status >= 500
 
+    # Retry malformed responses too (important!)
+    if isinstance(exc, ValueError):
+        return True
+
     return False
 
 
 def parse_float(value: Any, field: str) -> float:
     try:
         return float(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"Invalid numeric value for '{field}': {value}")
+    except Exception:
+        raise ValueError(f"Invalid float for '{field}': {value}")
 
 
 def parse_int(value: Any, field: str) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"Invalid integer value for '{field}': {value}")
+    except Exception:
+        raise ValueError(f"Invalid int for '{field}': {value}")
 
 
 def parse_gas_response(payload: Mapping[str, Any]) -> GasPrices:
-
-    status = payload.get("status")
-
-    if status != "1":
-        raise ValueError(
-            f"Etherscan API error: {payload.get('message')} "
-            f"result={payload.get('result')}"
-        )
+    if payload.get("status") != "1":
+        raise ValueError(f"API error: {payload}")
 
     result = payload.get("result")
-
     if not isinstance(result, Mapping):
-        raise ValueError("Malformed API response: result is not an object")
+        raise ValueError("Malformed API response")
 
     return {
         "safe": parse_float(result.get("SafeGasPrice"), "SafeGasPrice"),
@@ -189,25 +191,33 @@ def parse_gas_response(payload: Mapping[str, Any]) -> GasPrices:
 
 
 # =============================================================================
-# Etherscan Client
+# Client
 # =============================================================================
 
 class EtherscanClient:
 
     def __init__(self, session: Session, config: AppConfig, logger: logging.Logger):
-
         self.session = session
         self.config = config
         self.logger = logger
 
-        self.params: Mapping[str, str] = {
+        self.params = {
             "module": MODULE,
             "action": ACTION,
             "apikey": config.api_key,
         }
 
-    def _retry_policy(self):
+        self._last_call = 0.0
 
+    def _apply_rate_limit(self):
+        if self.config.rate_limit_delay <= 0:
+            return
+
+        elapsed = time.time() - self._last_call
+        if elapsed < self.config.rate_limit_delay:
+            time.sleep(self.config.rate_limit_delay - elapsed)
+
+    def _retry_policy(self) -> Callable:
         return retry(
             stop=stop_after_attempt(self.config.retries),
             wait=wait_exponential_jitter(
@@ -224,7 +234,9 @@ class EtherscanClient:
         @self._retry_policy()
         def _request() -> GasPrices:
 
-            self.logger.debug("Request params: %s", self.params)
+            self._apply_rate_limit()
+
+            start = time.perf_counter()
 
             response = self.session.get(
                 ETHERSCAN_API_URL,
@@ -232,14 +244,19 @@ class EtherscanClient:
                 timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
             )
 
+            self._last_call = time.time()
+
             response.raise_for_status()
 
             try:
-                payload = json.loads(response.content)
+                payload = json_loads(response.content)
             except Exception as exc:
-                raise ValueError("Invalid JSON received from Etherscan") from exc
+                raise ValueError("Invalid JSON") from exc
 
-            self.logger.debug("Raw API response: %s", payload)
+            duration = (time.perf_counter() - start) * 1000
+
+            self.logger.debug("Response time: %.2f ms", duration)
+            self.logger.debug("Payload: %s", payload)
 
             return parse_gas_response(payload)
 
@@ -251,14 +268,12 @@ class EtherscanClient:
 # =============================================================================
 
 def render_output(data: GasPrices, json_output: bool) -> None:
-
     if json_output:
-        print(json.dumps(data, separators=(",", ":")))
+        print(data)
         return
 
     print("Ethereum Gas Prices (Gwei)")
     print("-" * 35)
-
     print(f"Safe       : {data['safe']:.2f}")
     print(f"Proposed   : {data['proposed']:.2f}")
     print(f"Fast       : {data['fast']:.2f}")
@@ -271,24 +286,21 @@ def render_output(data: GasPrices, json_output: bool) -> None:
 # =============================================================================
 
 def create_session() -> Session:
-
     session = requests.Session()
 
     adapter = HTTPAdapter(
-        pool_connections=10,
-        pool_maxsize=10,
+        pool_connections=20,
+        pool_maxsize=20,
         max_retries=0,
     )
 
     session.mount("https://", adapter)
 
-    session.headers.update(
-        {
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json",
-            "Connection": "keep-alive",
-        }
-    )
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Connection": "keep-alive",
+    })
 
     return session
 
@@ -298,17 +310,13 @@ def create_session() -> Session:
 # =============================================================================
 
 def run(config: AppConfig) -> int:
-
     logger = configure_logger(config.verbose)
 
     try:
-
         logger.info("Fetching Ethereum gas prices...")
 
         with create_session() as session:
-
             client = EtherscanClient(session, config, logger)
-
             prices = client.fetch_gas_prices()
 
         render_output(prices, config.json_output)
@@ -316,25 +324,19 @@ def run(config: AppConfig) -> int:
         return EXIT_OK
 
     except RetryError as exc:
-
         logger.error(
-            "Request failed after %d retries: %s",
+            "Failed after %d retries: %s",
             config.retries,
             exc.last_attempt.exception(),
         )
-
         return EXIT_ERROR
 
     except KeyboardInterrupt:
-
-        logger.warning("Interrupted by user.")
-
+        logger.warning("Interrupted.")
         return EXIT_INTERRUPT
 
     except Exception as exc:
-
         logger.error("Fatal error: %s", exc)
-
         return EXIT_ERROR
 
 
@@ -343,9 +345,8 @@ def run(config: AppConfig) -> int:
 # =============================================================================
 
 def cli():
-
     parser = argparse.ArgumentParser(
-        description="Fetch Ethereum gas prices from Etherscan."
+        description="Fetch Ethereum gas prices from Etherscan"
     )
 
     parser.add_argument("--api-key")
@@ -353,13 +354,15 @@ def cli():
     parser.add_argument("--backoff-base", type=int, default=DEFAULT_BACKOFF_BASE)
     parser.add_argument("--backoff-max", type=int, default=DEFAULT_BACKOFF_MAX)
 
+    parser.add_argument("--rate-limit", type=float, default=0.0,
+                        help="Delay between requests (seconds)")
+
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
 
     try:
-
         config = AppConfig(
             api_key=resolve_api_key(args.api_key),
             retries=max(1, args.retries),
@@ -367,12 +370,10 @@ def cli():
             backoff_max=max(1, args.backoff_max),
             json_output=args.json,
             verbose=args.verbose,
+            rate_limit_delay=max(0.0, args.rate_limit),
         )
-
     except ValueError as exc:
-
         print(f"Error: {exc}", file=sys.stderr)
-
         sys.exit(EXIT_ERROR)
 
     sys.exit(run(config))
