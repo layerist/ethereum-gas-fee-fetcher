@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-Etherscan Gas Tracker (Production-grade v5)
-------------------------------------------
+Etherscan Gas Tracker (Production-grade v6)
+===========================================
+
 Major upgrades:
-- Circuit breaker (protects from API outages)
-- Structured logging with request_id
-- Async support (optional)
-- Better retry separation (network vs API errors)
-- Strict schema validation
-- Proper JSON output
+- True async support (httpx.AsyncClient)
+- Advanced circuit breaker (CLOSED / OPEN / HALF_OPEN)
+- Thread-safe rate limiter
+- Pydantic schema validation
+- Strong retry separation
+- Metrics collection
+- Graceful shutdown
+- Better logging
+- Configurable request timeout
+- Structured JSON output
 - Polling mode
-- Improved session tuning
+- Cleaner architecture
+- Sync + Async clients
 """
 
 from __future__ import annotations
@@ -20,47 +26,40 @@ import sys
 import time
 import json
 import uuid
+import signal
+import asyncio
 import logging
 import argparse
+import threading
+
+from enum import Enum
+from typing import Optional, Any, Dict
 from dataclasses import dataclass
-from typing import Mapping, Any, Optional, TypedDict, Callable
 
 import requests
-from requests import Session
-from requests.adapters import HTTPAdapter
-from requests.exceptions import (
-    ConnectTimeout,
-    ReadTimeout,
-    ConnectionError,
-    HTTPError,
-)
-
+import httpx
+from pydantic import BaseModel, ValidationError, Field
 from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential_jitter,
-    before_sleep_log,
     retry_if_exception,
-    RetryError,
+    before_sleep_log,
 )
 
-# Optional ultra-fast JSON
+# =============================================================================
+# Optional orjson
+# =============================================================================
+
 try:
     import orjson
 
-    def json_loads(data: bytes):
-        return orjson.loads(data)
-
-    def json_dumps(data: Any):
+    def json_dumps(data: Any) -> str:
         return orjson.dumps(data).decode()
 
 except ImportError:
-    def json_loads(data: bytes):
-        return json.loads(data)
-
-    def json_dumps(data: Any):
+    def json_dumps(data: Any) -> str:
         return json.dumps(data, indent=2)
-
 
 # =============================================================================
 # Constants
@@ -71,35 +70,23 @@ ETHERSCAN_API_URL = "https://api.etherscan.io/api"
 MODULE = "gastracker"
 ACTION = "gasoracle"
 
-CONNECT_TIMEOUT = 3
-READ_TIMEOUT = 10
+DEFAULT_CONNECT_TIMEOUT = 3.0
+DEFAULT_READ_TIMEOUT = 10.0
 
-DEFAULT_RETRIES = 3
+DEFAULT_RETRIES = 5
 DEFAULT_BACKOFF_BASE = 1
 DEFAULT_BACKOFF_MAX = 10
 
-USER_AGENT = "EtherscanGasTracker/5.0"
+USER_AGENT = "EtherscanGasTracker/6.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_INTERRUPT = 130
 
-
-# =============================================================================
-# Types
-# =============================================================================
-
-class GasPrices(TypedDict):
-    safe: float
-    proposed: float
-    fast: float
-    base_fee: float
-    last_block: int
-
-
 # =============================================================================
 # Config
 # =============================================================================
+
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -107,135 +94,254 @@ class AppConfig:
     retries: int = DEFAULT_RETRIES
     backoff_base: int = DEFAULT_BACKOFF_BASE
     backoff_max: int = DEFAULT_BACKOFF_MAX
-    json_output: bool = False
-    verbose: bool = False
-    rate_limit_delay: float = 0.0
+
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT
+    read_timeout: float = DEFAULT_READ_TIMEOUT
+
     poll_interval: float = 0.0
-    timeout_total: float = 15.0
+    rate_limit_delay: float = 0.0
+
+    verbose: bool = False
+    json_output: bool = False
+    async_mode: bool = False
 
 
 # =============================================================================
-# Logging
+# Logger
 # =============================================================================
+
 
 def configure_logger(verbose: bool) -> logging.Logger:
-    logger = logging.getLogger("etherscan_gas_tracker")
+    logger = logging.getLogger("etherscan")
 
     if logger.handlers:
         return logger
 
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s | %(levelname)-8s | %(message)s",
-            "%H:%M:%S",
-        )
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        "%H:%M:%S",
     )
 
+    handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    logger.propagate = False
 
+    logger.propagate = False
     return logger
+
+
+# =============================================================================
+# Models
+# =============================================================================
+
+
+class GasPrices(BaseModel):
+    safe: float = Field(..., ge=0)
+    proposed: float = Field(..., ge=0)
+    fast: float = Field(..., ge=0)
+    base_fee: float = Field(..., ge=0)
+    last_block: int = Field(..., ge=0)
+
+
+class EtherscanResponse(BaseModel):
+    status: str
+    message: str
+    result: Dict[str, Any]
+
+
+# =============================================================================
+# Metrics
+# =============================================================================
+
+
+class Metrics:
+    def __init__(self):
+        self.total_requests = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.total_latency_ms = 0.0
+
+    def add_success(self, latency_ms: float):
+        self.total_requests += 1
+        self.successful_requests += 1
+        self.total_latency_ms += latency_ms
+
+    def add_failure(self):
+        self.total_requests += 1
+        self.failed_requests += 1
+
+    @property
+    def avg_latency(self) -> float:
+        if self.successful_requests == 0:
+            return 0.0
+        return self.total_latency_ms / self.successful_requests
 
 
 # =============================================================================
 # Circuit Breaker
 # =============================================================================
 
+
+class CircuitState(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
 class CircuitBreaker:
-    def __init__(self, failure_threshold=5, recovery_time=30):
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: int = 30,
+    ):
         self.failure_threshold = failure_threshold
-        self.recovery_time = recovery_time
+        self.recovery_timeout = recovery_timeout
+
         self.failures = 0
-        self.last_failure_time = 0
+        self.last_failure_time = 0.0
+        self.state = CircuitState.CLOSED
 
-    def allow(self) -> bool:
-        if self.failures < self.failure_threshold:
+        self._lock = threading.Lock()
+
+    def allow_request(self) -> bool:
+        with self._lock:
+
+            if self.state == CircuitState.CLOSED:
+                return True
+
+            if self.state == CircuitState.OPEN:
+                elapsed = time.time() - self.last_failure_time
+
+                if elapsed >= self.recovery_timeout:
+                    self.state = CircuitState.HALF_OPEN
+                    return True
+
+                return False
+
             return True
-
-        if time.time() - self.last_failure_time > self.recovery_time:
-            self.failures = 0
-            return True
-
-        return False
 
     def record_success(self):
-        self.failures = 0
+        with self._lock:
+            self.failures = 0
+            self.state = CircuitState.CLOSED
 
     def record_failure(self):
-        self.failures += 1
-        self.last_failure_time = time.time()
+        with self._lock:
+            self.failures += 1
+            self.last_failure_time = time.time()
+
+            if self.failures >= self.failure_threshold:
+                self.state = CircuitState.OPEN
+
+
+# =============================================================================
+# Rate Limiter
+# =============================================================================
+
+
+class RateLimiter:
+
+    def __init__(self, delay: float):
+        self.delay = delay
+        self.lock = threading.Lock()
+        self.last_call = 0.0
+
+    def wait(self):
+        if self.delay <= 0:
+            return
+
+        with self.lock:
+            elapsed = time.time() - self.last_call
+
+            if elapsed < self.delay:
+                time.sleep(self.delay - elapsed)
+
+            self.last_call = time.time()
+
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+
+class APIError(Exception):
+    pass
+
+
+class CircuitBreakerOpen(Exception):
+    pass
 
 
 # =============================================================================
 # Utils
 # =============================================================================
 
+
 def resolve_api_key(cli_key: Optional[str]) -> str:
-    api_key = cli_key or os.getenv("ETHERSCAN_API_KEY")
+    key = cli_key or os.getenv("ETHERSCAN_API_KEY")
 
-    if not api_key:
-        raise ValueError("Missing Etherscan API key.")
+    if not key:
+        raise ValueError(
+            "Missing API key. "
+            "Use --api-key or ETHERSCAN_API_KEY."
+        )
 
-    return api_key
+    return key
+
+
+def parse_gas(payload: dict) -> GasPrices:
+    response = EtherscanResponse.model_validate(payload)
+
+    if response.status != "1":
+        raise APIError(response.message)
+
+    result = response.result
+
+    return GasPrices(
+        safe=float(result["SafeGasPrice"]),
+        proposed=float(result["ProposeGasPrice"]),
+        fast=float(result["FastGasPrice"]),
+        base_fee=float(result["suggestBaseFee"]),
+        last_block=int(result["LastBlock"]),
+    )
 
 
 def is_retryable_exception(exc: Exception) -> bool:
-    if isinstance(exc, (ConnectTimeout, ReadTimeout, ConnectionError)):
-        return True
+    retryable = (
+        requests.Timeout,
+        requests.ConnectionError,
+        httpx.TimeoutException,
+        httpx.NetworkError,
+        APIError,
+    )
 
-    if isinstance(exc, HTTPError) and exc.response is not None:
-        return exc.response.status_code >= 500 or exc.response.status_code == 429
-
-    if isinstance(exc, ValueError):
-        return True
-
-    return False
-
-
-def parse_float(value: Any, field: str) -> float:
-    try:
-        return float(value)
-    except Exception:
-        raise ValueError(f"Invalid float: {field}={value}")
-
-
-def parse_int(value: Any, field: str) -> int:
-    try:
-        return int(value)
-    except Exception:
-        raise ValueError(f"Invalid int: {field}={value}")
-
-
-def parse_gas_response(payload: Mapping[str, Any]) -> GasPrices:
-    if payload.get("status") != "1":
-        raise ValueError(f"API error: {payload}")
-
-    result = payload.get("result")
-    if not isinstance(result, Mapping):
-        raise ValueError("Malformed response")
-
-    return {
-        "safe": parse_float(result.get("SafeGasPrice"), "SafeGasPrice"),
-        "proposed": parse_float(result.get("ProposeGasPrice"), "ProposeGasPrice"),
-        "fast": parse_float(result.get("FastGasPrice"), "FastGasPrice"),
-        "base_fee": parse_float(result.get("suggestBaseFee"), "suggestBaseFee"),
-        "last_block": parse_int(result.get("LastBlock"), "LastBlock"),
-    }
+    return isinstance(exc, retryable)
 
 
 # =============================================================================
 # Client
 # =============================================================================
 
+
 class EtherscanClient:
 
-    def __init__(self, session: Session, config: AppConfig, logger: logging.Logger):
-        self.session = session
+    def __init__(
+        self,
+        config: AppConfig,
+        logger: logging.Logger,
+    ):
         self.config = config
         self.logger = logger
-        self.cb = CircuitBreaker()
+
+        self.metrics = Metrics()
+        self.breaker = CircuitBreaker()
+        self.rate_limiter = RateLimiter(
+            config.rate_limit_delay
+        )
 
         self.params = {
             "module": MODULE,
@@ -243,189 +349,312 @@ class EtherscanClient:
             "apikey": config.api_key,
         }
 
-        self._last_call = 0.0
+        self.session = requests.Session()
 
-    def _rate_limit(self):
-        if self.config.rate_limit_delay <= 0:
-            return
+        self.session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Connection": "keep-alive",
+        })
 
-        elapsed = time.time() - self._last_call
-        if elapsed < self.config.rate_limit_delay:
-            time.sleep(self.config.rate_limit_delay - elapsed)
-
-    def _retry_policy(self) -> Callable:
+    def _retry_policy(self):
         return retry(
-            stop=stop_after_attempt(self.config.retries),
+            stop=stop_after_attempt(
+                self.config.retries
+            ),
             wait=wait_exponential_jitter(
                 initial=self.config.backoff_base,
                 max=self.config.backoff_max,
             ),
-            retry=retry_if_exception(is_retryable_exception),
-            before_sleep=before_sleep_log(self.logger, logging.WARNING),
+            retry=retry_if_exception(
+                is_retryable_exception
+            ),
+            before_sleep=before_sleep_log(
+                self.logger,
+                logging.WARNING,
+            ),
             reraise=True,
         )
+
+    @_retry_policy
+    def fetch_gas_prices(self) -> GasPrices:
+        raise RuntimeError("Decorator placeholder")
+
+
+# =============================================================================
+# Sync implementation
+# =============================================================================
+
+
+class SyncEtherscanClient(EtherscanClient):
+
+    def __init__(
+        self,
+        config: AppConfig,
+        logger: logging.Logger,
+    ):
+        super().__init__(config, logger)
 
     def fetch_gas_prices(self) -> GasPrices:
 
         @self._retry_policy()
         def _request() -> GasPrices:
 
-            if not self.cb.allow():
-                raise RuntimeError("Circuit breaker open")
+            if not self.breaker.allow_request():
+                raise CircuitBreakerOpen(
+                    "Circuit breaker open"
+                )
 
-            self._rate_limit()
+            self.rate_limiter.wait()
 
             request_id = str(uuid.uuid4())[:8]
+
             start = time.perf_counter()
 
-            self.logger.debug(f"[{request_id}] Sending request")
+            self.logger.debug(
+                f"[{request_id}] Request started"
+            )
 
             response = self.session.get(
                 ETHERSCAN_API_URL,
                 params=self.params,
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                timeout=(
+                    self.config.connect_timeout,
+                    self.config.read_timeout,
+                ),
             )
-
-            self._last_call = time.time()
 
             response.raise_for_status()
 
-            payload = json_loads(response.content)
+            latency_ms = (
+                time.perf_counter() - start
+            ) * 1000
 
-            duration = (time.perf_counter() - start) * 1000
+            payload = response.json()
 
-            self.logger.debug(
-                f"[{request_id}] Done in {duration:.2f} ms"
+            gas = parse_gas(payload)
+
+            self.metrics.add_success(
+                latency_ms
             )
 
-            data = parse_gas_response(payload)
+            self.breaker.record_success()
 
-            self.cb.record_success()
+            self.logger.debug(
+                f"[{request_id}] "
+                f"{latency_ms:.2f} ms"
+            )
 
-            return data
+            return gas
 
         try:
             return _request()
+
         except Exception:
-            self.cb.record_failure()
+            self.metrics.add_failure()
+            self.breaker.record_failure()
             raise
+
+
+# =============================================================================
+# Async implementation
+# =============================================================================
+
+
+class AsyncEtherscanClient:
+
+    def __init__(
+        self,
+        config: AppConfig,
+        logger: logging.Logger,
+    ):
+        self.config = config
+        self.logger = logger
+
+        self.client = httpx.AsyncClient(
+            headers={
+                "User-Agent": USER_AGENT
+            },
+            timeout=httpx.Timeout(
+                connect=config.connect_timeout,
+                read=config.read_timeout,
+            ),
+        )
+
+    async def fetch_gas_prices(
+        self,
+    ) -> GasPrices:
+
+        response = await self.client.get(
+            ETHERSCAN_API_URL,
+            params={
+                "module": MODULE,
+                "action": ACTION,
+                "apikey": self.config.api_key,
+            },
+        )
+
+        response.raise_for_status()
+
+        payload = response.json()
+
+        return parse_gas(payload)
+
+    async def close(self):
+        await self.client.aclose()
 
 
 # =============================================================================
 # Output
 # =============================================================================
 
-def render_output(data: GasPrices, json_output: bool):
+
+def render_output(
+    data: GasPrices,
+    json_output: bool,
+):
+    payload = data.model_dump()
+
     if json_output:
-        print(json_dumps(data))
+        print(json_dumps(payload))
         return
 
-    print("\nEthereum Gas Prices (Gwei)")
-    print("-" * 35)
-    print(f"Safe       : {data['safe']:.2f}")
-    print(f"Proposed   : {data['proposed']:.2f}")
-    print(f"Fast       : {data['fast']:.2f}")
-    print(f"Base Fee   : {data['base_fee']:.2f}")
-    print(f"Last Block : {data['last_block']}")
+    print("\nEthereum Gas Prices")
+    print("-" * 40)
+
+    print(f"Safe       : {data.safe:.2f}")
+    print(f"Proposed   : {data.proposed:.2f}")
+    print(f"Fast       : {data.fast:.2f}")
+    print(f"Base Fee   : {data.base_fee:.2f}")
+    print(f"Last Block : {data.last_block}")
 
 
 # =============================================================================
-# Session
+# Main
 # =============================================================================
 
-def create_session() -> Session:
-    session = requests.Session()
 
-    adapter = HTTPAdapter(
-        pool_connections=50,
-        pool_maxsize=50,
-        max_retries=0,
-    )
-
-    session.mount("https://", adapter)
-
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-        "Connection": "keep-alive",
-    })
-
-    return session
+shutdown_event = threading.Event()
 
 
-# =============================================================================
-# Runner
-# =============================================================================
+def signal_handler(*_):
+    shutdown_event.set()
 
-def run(config: AppConfig) -> int:
-    logger = configure_logger(config.verbose)
-
-    try:
-        with create_session() as session:
-            client = EtherscanClient(session, config, logger)
-
-            while True:
-                logger.info("Fetching gas prices...")
-
-                prices = client.fetch_gas_prices()
-                render_output(prices, config.json_output)
-
-                if config.poll_interval <= 0:
-                    break
-
-                time.sleep(config.poll_interval)
-
-        return EXIT_OK
-
-    except RetryError as exc:
-        logger.error("Retry failed: %s", exc)
-        return EXIT_ERROR
-
-    except KeyboardInterrupt:
-        logger.warning("Interrupted.")
-        return EXIT_INTERRUPT
-
-    except Exception as exc:
-        logger.error("Fatal: %s", exc)
-        return EXIT_ERROR
-
-
-# =============================================================================
-# CLI
-# =============================================================================
 
 def cli():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--api-key")
-    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
-    parser.add_argument("--backoff-base", type=int, default=DEFAULT_BACKOFF_BASE)
-    parser.add_argument("--backoff-max", type=int, default=DEFAULT_BACKOFF_MAX)
-    parser.add_argument("--rate-limit", type=float, default=0.0)
-    parser.add_argument("--poll", type=float, default=0.0,
-                        help="Polling interval (seconds)")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--async-mode", action="store_true")
+
+    parser.add_argument(
+        "--poll",
+        type=float,
+        default=0.0,
+    )
 
     args = parser.parse_args()
 
-    try:
-        config = AppConfig(
-            api_key=resolve_api_key(args.api_key),
-            retries=args.retries,
-            backoff_base=args.backoff_base,
-            backoff_max=args.backoff_max,
-            json_output=args.json,
-            verbose=args.verbose,
-            rate_limit_delay=args.rate_limit,
-            poll_interval=args.poll,
-        )
-    except ValueError as e:
-        print(e, file=sys.stderr)
-        sys.exit(EXIT_ERROR)
+    signal.signal(
+        signal.SIGINT,
+        signal_handler,
+    )
 
-    sys.exit(run(config))
+    logger = configure_logger(
+        args.verbose
+    )
+
+    config = AppConfig(
+        api_key=resolve_api_key(
+            args.api_key
+        ),
+        json_output=args.json,
+        verbose=args.verbose,
+        poll_interval=args.poll,
+        async_mode=args.async_mode,
+    )
+
+    try:
+
+        if config.async_mode:
+
+            async def async_runner():
+
+                client = AsyncEtherscanClient(
+                    config,
+                    logger,
+                )
+
+                while (
+                    not shutdown_event.is_set()
+                ):
+                    data = await (
+                        client.fetch_gas_prices()
+                    )
+
+                    render_output(
+                        data,
+                        config.json_output,
+                    )
+
+                    if (
+                        config.poll_interval
+                        <= 0
+                    ):
+                        break
+
+                    await asyncio.sleep(
+                        config.poll_interval
+                    )
+
+                await client.close()
+
+            asyncio.run(async_runner())
+
+        else:
+
+            client = SyncEtherscanClient(
+                config,
+                logger,
+            )
+
+            while (
+                not shutdown_event.is_set()
+            ):
+                data = (
+                    client.fetch_gas_prices()
+                )
+
+                render_output(
+                    data,
+                    config.json_output,
+                )
+
+                if (
+                    config.poll_interval
+                    <= 0
+                ):
+                    break
+
+                time.sleep(
+                    config.poll_interval
+                )
+
+        return EXIT_OK
+
+    except ValidationError as exc:
+        logger.error(
+            "Validation error: %s",
+            exc,
+        )
+
+    except Exception as exc:
+        logger.error("Fatal: %s", exc)
+
+    return EXIT_ERROR
 
 
 if __name__ == "__main__":
-    cli()
+    sys.exit(cli())
