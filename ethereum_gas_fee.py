@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Etherscan Gas Tracker (Production-grade v6)
+Etherscan Gas Tracker (Production-grade v7)
 ===========================================
 
 Major upgrades:
@@ -658,3 +658,5 @@ def cli():
 
 if __name__ == "__main__":
     sys.exit(cli())
+
+# TODO improved
