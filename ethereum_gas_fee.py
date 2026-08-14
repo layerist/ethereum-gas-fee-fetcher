@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Etherscan Gas Tracker v9
-========================
+Etherscan Gas Tracker v10
+=========================
 
 Надёжный CLI-клиент Etherscan API V2 для получения актуальных цен газа.
 
@@ -9,9 +9,10 @@ Etherscan Gas Tracker v9
 - Etherscan API V2 и выбор EVM-сети через --chain-id;
 - синхронный requests-клиент и асинхронный httpx-клиент;
 - корректный retry только для временных ошибок;
+- Retry-After имеет приоритет над локальным backoff cap;
 - учёт Retry-After при HTTP 429/503;
 - exponential backoff с full jitter;
-- thread-safe circuit breaker с единственным HALF_OPEN probe;
+- thread-safe circuit breaker с единственным HALF_OPEN probe без зависания probe;
 - монотонный rate limiter;
 - строгая валидация ответа Pydantic v1/v2;
 - Decimal для значений gas без ранней потери точности;
@@ -75,7 +76,7 @@ DEFAULT_BACKOFF_MAX = 15.0
 DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5
 DEFAULT_CIRCUIT_RECOVERY_TIMEOUT = 30.0
 DEFAULT_RATE_LIMIT_DELAY = 0.35  # conservative default for Free plan
-USER_AGENT = "EtherscanGasTracker/9.0"
+USER_AGENT = "EtherscanGasTracker/10.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -224,7 +225,9 @@ class APIError(TrackerError):
 
 
 class RetryableAPIError(APIError):
-    pass
+    def __init__(self, message: str, *, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class NonRetryableAPIError(APIError):
@@ -368,6 +371,25 @@ class CircuitBreaker:
                 self.opened_at = time.monotonic()
             self._probe_in_flight = False
 
+    def record_neutral(self) -> None:
+        """Release a HALF_OPEN probe for a non-transient/application error.
+
+        A valid HTTP response such as 401/403 proves that the remote endpoint is
+        reachable, so it must not leave the breaker stuck in HALF_OPEN. It also
+        must not count as an infrastructure failure.
+        """
+        with self._lock:
+            if self.state == CircuitState.HALF_OPEN:
+                self.state = CircuitState.CLOSED
+                self.opened_at = None
+                self.failures = 0
+            self._probe_in_flight = False
+
+    def cancel_permission(self) -> None:
+        """Release a probe when no attempt was completed (for example shutdown)."""
+        with self._lock:
+            self._probe_in_flight = False
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             retry_in = None
@@ -504,7 +526,10 @@ def classify_etherscan_error(message: Any, result: Any) -> APIError:
 
 
 def parse_gas(payload: Mapping[str, Any], chain_id: str) -> GasPrices:
-    envelope = model_validate_compat(EtherscanEnvelope, payload)
+    try:
+        envelope = model_validate_compat(EtherscanEnvelope, payload)
+    except ValidationError as exc:
+        raise RetryableAPIError(f"invalid Etherscan response envelope: {exc}") from exc
     if envelope.status != "1":
         raise classify_etherscan_error(envelope.message, envelope.result)
     if not isinstance(envelope.result, Mapping):
@@ -536,16 +561,19 @@ def parse_gas(payload: Mapping[str, Any], chain_id: str) -> GasPrices:
     except (TypeError, ValueError) as exc:
         raise APIError(f"invalid LastBlock: {result['LastBlock']!r}") from exc
 
-    return GasPrices(
-        chain_id=chain_id,
-        safe_gwei=decimal_value(result["SafeGasPrice"], "SafeGasPrice"),
-        proposed_gwei=decimal_value(result["ProposeGasPrice"], "ProposeGasPrice"),
-        fast_gwei=decimal_value(result["FastGasPrice"], "FastGasPrice"),
-        base_fee_gwei=decimal_value(result["suggestBaseFee"], "suggestBaseFee"),
-        last_block=last_block,
-        gas_used_ratio=ratios,
-        fetched_at=utc_now_iso(),
-    )
+    try:
+        return GasPrices(
+            chain_id=chain_id,
+            safe_gwei=decimal_value(result["SafeGasPrice"], "SafeGasPrice"),
+            proposed_gwei=decimal_value(result["ProposeGasPrice"], "ProposeGasPrice"),
+            fast_gwei=decimal_value(result["FastGasPrice"], "FastGasPrice"),
+            base_fee_gwei=decimal_value(result["suggestBaseFee"], "suggestBaseFee"),
+            last_block=last_block,
+            gas_used_ratio=ratios,
+            fetched_at=utc_now_iso(),
+        )
+    except ValidationError as exc:
+        raise RetryableAPIError(f"invalid Etherscan gas payload: {exc}") from exc
 
 
 def parse_retry_after(value: Optional[str]) -> Optional[float]:
@@ -602,7 +630,9 @@ def compute_backoff_delay(
     jittered = random.uniform(0.0, cap)  # full jitter
     if retry_after is None:
         return jittered
-    return min(max_delay, max(jittered, retry_after))
+    # Retry-After is a server-side minimum. Do not silently cap it with
+    # --backoff-max; doing so can cause another immediate 429/503.
+    return max(jittered, retry_after)
 
 
 def safe_body_preview(text: str, limit: int = 300) -> str:
@@ -677,11 +707,6 @@ class SyncEtherscanClient(BaseEtherscanClient):
                     raise
                 except Exception as exc:
                     last_error = exc
-                    if is_retryable_exception(exc) or (
-                        isinstance(exc, APIError)
-                        and not isinstance(exc, NonRetryableAPIError)
-                    ):
-                        self.breaker.record_failure()
                     failure = AttemptFailure(exc, getattr(exc, "retry_after", None))
                     if attempt_no >= self.config.retries or not is_retryable_exception(exc):
                         raise
@@ -704,12 +729,12 @@ class SyncEtherscanClient(BaseEtherscanClient):
 
     def _fetch_once(self) -> GasPrices:
         self.breaker.acquire_permission()
-        self.rate_limiter.wait(self.shutdown_event)
-        if self.shutdown_event.is_set():
-            raise ShutdownRequested
-
-        start = time.perf_counter()
         try:
+            self.rate_limiter.wait(self.shutdown_event)
+            if self.shutdown_event.is_set():
+                raise ShutdownRequested
+
+            start = time.perf_counter()
             response = self.session.get(
                 self.config.api_url,
                 params=self.params,
@@ -721,7 +746,8 @@ class SyncEtherscanClient(BaseEtherscanClient):
                     response.status_code,
                     safe_body_preview(response.text),
                 )
-                setattr(error, "retry_after", parse_retry_after(response.headers.get("Retry-After")))
+                if isinstance(error, RetryableAPIError):
+                    error.retry_after = parse_retry_after(response.headers.get("Retry-After"))
                 raise error
             try:
                 payload = response.json()
@@ -730,11 +756,21 @@ class SyncEtherscanClient(BaseEtherscanClient):
                     f"invalid JSON response: {safe_body_preview(response.text)}"
                 ) from exc
             gas = parse_gas(payload, self.config.chain_id)
-        except Exception:
+        except ShutdownRequested:
+            self.breaker.cancel_permission()
+            raise
+        except Exception as exc:
+            if is_retryable_exception(exc):
+                self.breaker.record_failure()
+            else:
+                self.breaker.record_neutral()
             raise
         else:
             self.breaker.record_success()
-            self.logger.debug("sync HTTP attempt completed in %.2f ms", (time.perf_counter() - start) * 1000)
+            self.logger.debug(
+                "sync HTTP attempt completed in %.2f ms",
+                (time.perf_counter() - start) * 1000,
+            )
             return gas
 
 
@@ -781,11 +817,6 @@ class AsyncEtherscanClient(BaseEtherscanClient):
                     raise
                 except Exception as exc:
                     last_error = exc
-                    if is_retryable_exception(exc) or (
-                        isinstance(exc, APIError)
-                        and not isinstance(exc, NonRetryableAPIError)
-                    ):
-                        self.breaker.record_failure()
                     failure = AttemptFailure(exc, getattr(exc, "retry_after", None))
                     if attempt_no >= self.config.retries or not is_retryable_exception(exc):
                         raise
@@ -808,29 +839,44 @@ class AsyncEtherscanClient(BaseEtherscanClient):
 
     async def _fetch_once(self) -> GasPrices:
         self.breaker.acquire_permission()
-        await self.rate_limiter.wait(self.shutdown_event)
-        if self.shutdown_event.is_set():
-            raise ShutdownRequested
-
-        start = time.perf_counter()
-        response = await self.client.get(self.config.api_url, params=self.params)
-        if not 200 <= response.status_code < 300:
-            error = classify_http_status(
-                response.status_code,
-                safe_body_preview(response.text),
-            )
-            setattr(error, "retry_after", parse_retry_after(response.headers.get("Retry-After")))
-            raise error
         try:
-            payload = response.json()
-        except json.JSONDecodeError as exc:
-            raise RetryableAPIError(
-                f"invalid JSON response: {safe_body_preview(response.text)}"
-            ) from exc
-        gas = parse_gas(payload, self.config.chain_id)
-        self.breaker.record_success()
-        self.logger.debug("async HTTP attempt completed in %.2f ms", (time.perf_counter() - start) * 1000)
-        return gas
+            await self.rate_limiter.wait(self.shutdown_event)
+            if self.shutdown_event.is_set():
+                raise ShutdownRequested
+
+            start = time.perf_counter()
+            response = await self.client.get(self.config.api_url, params=self.params)
+            if not 200 <= response.status_code < 300:
+                error = classify_http_status(
+                    response.status_code,
+                    safe_body_preview(response.text),
+                )
+                if isinstance(error, RetryableAPIError):
+                    error.retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                raise error
+            try:
+                payload = response.json()
+            except json.JSONDecodeError as exc:
+                raise RetryableAPIError(
+                    f"invalid JSON response: {safe_body_preview(response.text)}"
+                ) from exc
+            gas = parse_gas(payload, self.config.chain_id)
+        except ShutdownRequested:
+            self.breaker.cancel_permission()
+            raise
+        except Exception as exc:
+            if is_retryable_exception(exc):
+                self.breaker.record_failure()
+            else:
+                self.breaker.record_neutral()
+            raise
+        else:
+            self.breaker.record_success()
+            self.logger.debug(
+                "async HTTP attempt completed in %.2f ms",
+                (time.perf_counter() - start) * 1000,
+            )
+            return gas
 
 
 # =============================================================================
@@ -867,7 +913,7 @@ def render_output(
         print(json_dumps(payload, indent=False), flush=True)
         return
 
-    print("\nEthereum Gas Prices")
+    print("\nEVM Gas Prices")
     print("-" * 52)
     print(f"Chain ID   : {data.chain_id}")
     print(f"Safe       : {data.safe_gwei:.9f} gwei")
@@ -1081,12 +1127,14 @@ def config_from_args(args: argparse.Namespace) -> AppConfig:
 
 
 def cli(argv: Optional[list[str]] = None) -> int:
+    shutdown_event.clear()
     parser = build_parser()
     args = parser.parse_args(argv)
     logger = configure_logger(args.verbose, args.json or args.jsonl)
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, signal_handler)
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, signal_handler)
 
     try:
         config = config_from_args(args)
