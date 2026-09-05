@@ -1,38 +1,4 @@
 #!/usr/bin/env python3
-"""
-Etherscan Gas Tracker v10
-=========================
-
-Надёжный CLI-клиент Etherscan API V2 для получения актуальных цен газа.
-
-Основные возможности:
-- Etherscan API V2 и выбор EVM-сети через --chain-id;
-- синхронный requests-клиент и асинхронный httpx-клиент;
-- корректный retry только для временных ошибок;
-- Retry-After имеет приоритет над локальным backoff cap;
-- учёт Retry-After при HTTP 429/503;
-- exponential backoff с full jitter;
-- thread-safe circuit breaker с единственным HALF_OPEN probe без зависания probe;
-- монотонный rate limiter;
-- строгая валидация ответа Pydantic v1/v2;
-- Decimal для значений gas без ранней потери точности;
-- раздельные метрики логических запросов и HTTP-попыток;
-- корректное завершение по SIGINT/SIGTERM;
-- JSON, JSONL и человекочитаемый вывод;
-- polling с устойчивостью к временным ошибкам;
-- явный proxy либо proxy из переменных окружения.
-
-Установка:
-    pip install requests httpx pydantic
-    # необязательно:
-    pip install orjson
-
-Примеры:
-    python etherscan_gas_tracker_v9.py --api-key YOUR_KEY
-    python etherscan_gas_tracker_v9.py --chain-id 8453 --json
-    python etherscan_gas_tracker_v9.py --poll 10 --continue-on-error
-    python etherscan_gas_tracker_v9.py --async-mode --poll 10 --jsonl
-"""
 
 from __future__ import annotations
 
@@ -40,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import signal
@@ -76,7 +43,7 @@ DEFAULT_BACKOFF_MAX = 15.0
 DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5
 DEFAULT_CIRCUIT_RECOVERY_TIMEOUT = 30.0
 DEFAULT_RATE_LIMIT_DELAY = 0.35  # conservative default for Free plan
-USER_AGENT = "EtherscanGasTracker/10.0"
+USER_AGENT = "EtherscanGasTracker/11.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -147,6 +114,18 @@ class AppConfig:
             raise ValueError("--api-url must start with http:// or https://")
         if not self.chain_id.isdigit() or int(self.chain_id) <= 0:
             raise ValueError("--chain-id must be a positive integer")
+        numeric = {
+            "--backoff-base": self.backoff_base,
+            "--backoff-max": self.backoff_max,
+            "--connect-timeout": self.connect_timeout,
+            "--read-timeout": self.read_timeout,
+            "--poll": self.poll_interval,
+            "--rate-limit-delay": self.rate_limit_delay,
+            "--circuit-recovery-timeout": self.circuit_recovery_timeout,
+        }
+        for name, value in numeric.items():
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite")
         if self.retries < 1:
             raise ValueError("--retries must be >= 1")
         if self.backoff_base <= 0:
@@ -225,9 +204,16 @@ class APIError(TrackerError):
 
 
 class RetryableAPIError(APIError):
-    def __init__(self, message: str, *, retry_after: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: Optional[float] = None,
+        circuit_failure: bool = False,
+    ) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+        self.circuit_failure = circuit_failure
 
 
 class NonRetryableAPIError(APIError):
@@ -260,6 +246,8 @@ class Metrics:
         self.failed_requests = 0
         self.http_attempts = 0
         self.retry_attempts = 0
+        self.circuit_blocked = 0
+        self.rate_limited_responses = 0
         self.total_latency_ms = 0.0
         self.last_latency_ms = 0.0
         self.last_error: Optional[str] = None
@@ -274,6 +262,14 @@ class Metrics:
             self.http_attempts += 1
             if retry:
                 self.retry_attempts += 1
+
+    def add_circuit_blocked(self) -> None:
+        with self._lock:
+            self.circuit_blocked += 1
+
+    def add_rate_limited_response(self) -> None:
+        with self._lock:
+            self.rate_limited_responses += 1
 
     def finish_success(self, latency_ms: float) -> None:
         with self._lock:
@@ -300,6 +296,8 @@ class Metrics:
                 "failed_requests": self.failed_requests,
                 "http_attempts": self.http_attempts,
                 "retry_attempts": self.retry_attempts,
+                "circuit_blocked": self.circuit_blocked,
+                "rate_limited_responses": self.rate_limited_responses,
                 "avg_latency_ms": round(avg, 2),
                 "last_latency_ms": round(self.last_latency_ms, 2),
                 "last_error": self.last_error,
@@ -529,7 +527,9 @@ def parse_gas(payload: Mapping[str, Any], chain_id: str) -> GasPrices:
     try:
         envelope = model_validate_compat(EtherscanEnvelope, payload)
     except ValidationError as exc:
-        raise RetryableAPIError(f"invalid Etherscan response envelope: {exc}") from exc
+        raise RetryableAPIError(
+            f"invalid Etherscan response envelope: {exc}", circuit_failure=True
+        ) from exc
     if envelope.status != "1":
         raise classify_etherscan_error(envelope.message, envelope.result)
     if not isinstance(envelope.result, Mapping):
@@ -573,7 +573,9 @@ def parse_gas(payload: Mapping[str, Any], chain_id: str) -> GasPrices:
             fetched_at=utc_now_iso(),
         )
     except ValidationError as exc:
-        raise RetryableAPIError(f"invalid Etherscan gas payload: {exc}") from exc
+        raise RetryableAPIError(
+            f"invalid Etherscan gas payload: {exc}", circuit_failure=True
+        ) from exc
 
 
 def parse_retry_after(value: Optional[str]) -> Optional[float]:
@@ -596,8 +598,12 @@ def classify_http_status(status_code: int, body_preview: str) -> APIError:
     message = f"HTTP {status_code} from Etherscan"
     if body_preview:
         message += f": {body_preview}"
-    if status_code == 429 or 500 <= status_code <= 599:
-        return RetryableAPIError(message)
+    if status_code == 429:
+        # The endpoint is alive and explicitly throttling us. Retry it, but do
+        # not treat it as an infrastructure outage for the circuit breaker.
+        return RetryableAPIError(message, circuit_failure=False)
+    if 500 <= status_code <= 599:
+        return RetryableAPIError(message, circuit_failure=True)
     if status_code in (401, 403, 404):
         return NonRetryableAPIError(message)
     return APIError(message)
@@ -610,6 +616,22 @@ def is_retryable_exception(exc: Exception) -> bool:
         exc,
         (
             RetryableAPIError,
+            requests.Timeout,
+            requests.ConnectionError,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            httpx.PoolTimeout,
+        ),
+    )
+
+
+def is_circuit_failure(exc: Exception) -> bool:
+    if isinstance(exc, RetryableAPIError):
+        return exc.circuit_failure
+    return isinstance(
+        exc,
+        (
             requests.Timeout,
             requests.ConnectionError,
             httpx.TimeoutException,
@@ -698,9 +720,8 @@ class SyncEtherscanClient(BaseEtherscanClient):
 
         try:
             for attempt_no in range(1, self.config.retries + 1):
-                self.metrics.add_attempt(retry=attempt_no > 1)
                 try:
-                    gas = self._fetch_once()
+                    gas = self._fetch_once(retry=attempt_no > 1)
                     self.metrics.finish_success((time.perf_counter() - logical_start) * 1000)
                     return gas
                 except ShutdownRequested:
@@ -727,14 +748,19 @@ class SyncEtherscanClient(BaseEtherscanClient):
         self.metrics.finish_failure(error)
         raise error
 
-    def _fetch_once(self) -> GasPrices:
-        self.breaker.acquire_permission()
+    def _fetch_once(self, *, retry: bool) -> GasPrices:
+        try:
+            self.breaker.acquire_permission()
+        except CircuitBreakerOpen:
+            self.metrics.add_circuit_blocked()
+            raise
         try:
             self.rate_limiter.wait(self.shutdown_event)
             if self.shutdown_event.is_set():
                 raise ShutdownRequested
 
             start = time.perf_counter()
+            self.metrics.add_attempt(retry=retry)
             response = self.session.get(
                 self.config.api_url,
                 params=self.params,
@@ -748,19 +774,22 @@ class SyncEtherscanClient(BaseEtherscanClient):
                 )
                 if isinstance(error, RetryableAPIError):
                     error.retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                    if response.status_code == 429:
+                        self.metrics.add_rate_limited_response()
                 raise error
             try:
                 payload = response.json()
             except requests.JSONDecodeError as exc:
                 raise RetryableAPIError(
-                    f"invalid JSON response: {safe_body_preview(response.text)}"
+                    f"invalid JSON response: {safe_body_preview(response.text)}",
+                    circuit_failure=True,
                 ) from exc
             gas = parse_gas(payload, self.config.chain_id)
         except ShutdownRequested:
             self.breaker.cancel_permission()
             raise
         except Exception as exc:
-            if is_retryable_exception(exc):
+            if is_circuit_failure(exc):
                 self.breaker.record_failure()
             else:
                 self.breaker.record_neutral()
@@ -808,9 +837,8 @@ class AsyncEtherscanClient(BaseEtherscanClient):
 
         try:
             for attempt_no in range(1, self.config.retries + 1):
-                self.metrics.add_attempt(retry=attempt_no > 1)
                 try:
-                    gas = await self._fetch_once()
+                    gas = await self._fetch_once(retry=attempt_no > 1)
                     self.metrics.finish_success((time.perf_counter() - logical_start) * 1000)
                     return gas
                 except ShutdownRequested:
@@ -837,14 +865,19 @@ class AsyncEtherscanClient(BaseEtherscanClient):
         self.metrics.finish_failure(error)
         raise error
 
-    async def _fetch_once(self) -> GasPrices:
-        self.breaker.acquire_permission()
+    async def _fetch_once(self, *, retry: bool) -> GasPrices:
+        try:
+            self.breaker.acquire_permission()
+        except CircuitBreakerOpen:
+            self.metrics.add_circuit_blocked()
+            raise
         try:
             await self.rate_limiter.wait(self.shutdown_event)
             if self.shutdown_event.is_set():
                 raise ShutdownRequested
 
             start = time.perf_counter()
+            self.metrics.add_attempt(retry=retry)
             response = await self.client.get(self.config.api_url, params=self.params)
             if not 200 <= response.status_code < 300:
                 error = classify_http_status(
@@ -853,19 +886,22 @@ class AsyncEtherscanClient(BaseEtherscanClient):
                 )
                 if isinstance(error, RetryableAPIError):
                     error.retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                    if response.status_code == 429:
+                        self.metrics.add_rate_limited_response()
                 raise error
             try:
                 payload = response.json()
             except json.JSONDecodeError as exc:
                 raise RetryableAPIError(
-                    f"invalid JSON response: {safe_body_preview(response.text)}"
+                    f"invalid JSON response: {safe_body_preview(response.text)}",
+                    circuit_failure=True,
                 ) from exc
             gas = parse_gas(payload, self.config.chain_id)
         except ShutdownRequested:
             self.breaker.cancel_permission()
             raise
         except Exception as exc:
-            if is_retryable_exception(exc):
+            if is_circuit_failure(exc):
                 self.breaker.record_failure()
             else:
                 self.breaker.record_neutral()
@@ -941,6 +977,11 @@ def render_output(
             "Results    : "
             f"{metrics['successful_requests']} ok / "
             f"{metrics['failed_requests']} failed"
+        )
+        print(
+            "Control    : "
+            f"{metrics['circuit_blocked']} breaker-blocked / "
+            f"{metrics['rate_limited_responses']} rate-limited"
         )
         print(
             "Latency    : "
@@ -1074,7 +1115,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RATE_LIMIT_DELAY,
         help="Minimum spacing between HTTP attempts",
     )
-    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Maximum HTTP attempts per logical request")
     parser.add_argument("--backoff-base", type=float, default=DEFAULT_BACKOFF_BASE)
     parser.add_argument("--backoff-max", type=float, default=DEFAULT_BACKOFF_MAX)
     parser.add_argument("--connect-timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT)
@@ -1158,6 +1199,8 @@ def cli(argv: Optional[list[str]] = None) -> int:
         logger.error("non-retryable API error: %s", exc)
     except CircuitBreakerOpen as exc:
         logger.error("circuit breaker open: %s", exc)
+    except APIError as exc:
+        logger.error("API error: %s", exc)
     except KeyboardInterrupt:
         shutdown_event.set()
         return EXIT_INTERRUPT
