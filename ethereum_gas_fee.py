@@ -19,6 +19,7 @@ from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from enum import Enum
 from typing import Any, Mapping, Optional, TypeVar
+from urllib.parse import urlsplit
 
 import httpx
 import requests
@@ -43,7 +44,9 @@ DEFAULT_BACKOFF_MAX = 15.0
 DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 5
 DEFAULT_CIRCUIT_RECOVERY_TIMEOUT = 30.0
 DEFAULT_RATE_LIMIT_DELAY = 0.35  # conservative default for Free plan
-USER_AGENT = "EtherscanGasTracker/11.0"
+USER_AGENT = "EtherscanGasTracker/12.0"
+MAX_RETRY_AFTER = 300.0
+MAX_BODY_PREVIEW = 300
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -110,8 +113,9 @@ class AppConfig:
     def validate(self) -> None:
         if not self.api_key.strip():
             raise ValueError("API key is empty")
-        if not self.api_url.startswith(("https://", "http://")):
-            raise ValueError("--api-url must start with http:// or https://")
+        validate_http_url(self.api_url, "--api-url")
+        if self.proxy:
+            validate_http_url(self.proxy, "--proxy")
         if not self.chain_id.isdigit() or int(self.chain_id) <= 0:
             raise ValueError("--chain-id must be a positive integer")
         numeric = {
@@ -466,6 +470,19 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def validate_http_url(value: str, option_name: str) -> None:
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError(f"{option_name} is not a valid URL") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"{option_name} must be an absolute http:// or https:// URL")
+    if parsed.username or parsed.password:
+        # Credentials in the API endpoint itself are too easy to leak in logs/errors.
+        if option_name == "--api-url":
+            raise ValueError("--api-url must not contain embedded credentials")
+
+
 def resolve_api_key(cli_key: Optional[str]) -> str:
     value = (cli_key or os.getenv("ETHERSCAN_API_KEY", "")).strip()
     if not value:
@@ -524,6 +541,11 @@ def classify_etherscan_error(message: Any, result: Any) -> APIError:
 
 
 def parse_gas(payload: Mapping[str, Any], chain_id: str) -> GasPrices:
+    if not isinstance(payload, Mapping):
+        raise RetryableAPIError(
+            f"invalid Etherscan response type: {type(payload).__name__}",
+            circuit_failure=True,
+        )
     try:
         envelope = model_validate_compat(EtherscanEnvelope, payload)
     except ValidationError as exc:
@@ -560,6 +582,8 @@ def parse_gas(payload: Mapping[str, Any], chain_id: str) -> GasPrices:
         last_block = int(str(result["LastBlock"]))
     except (TypeError, ValueError) as exc:
         raise APIError(f"invalid LastBlock: {result['LastBlock']!r}") from exc
+    if last_block < 0:
+        raise APIError(f"invalid negative LastBlock: {last_block}")
 
     try:
         return GasPrices(
@@ -583,13 +607,17 @@ def parse_retry_after(value: Optional[str]) -> Optional[float]:
         return None
     value = value.strip()
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
+        if not math.isfinite(seconds):
+            return None
+        return min(MAX_RETRY_AFTER, max(0.0, seconds))
     except ValueError:
         try:
             retry_at = parsedate_to_datetime(value)
             if retry_at.tzinfo is None:
                 retry_at = retry_at.replace(tzinfo=timezone.utc)
-            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+            seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            return min(MAX_RETRY_AFTER, max(0.0, seconds))
         except (TypeError, ValueError, OverflowError):
             return None
 
@@ -598,13 +626,13 @@ def classify_http_status(status_code: int, body_preview: str) -> APIError:
     message = f"HTTP {status_code} from Etherscan"
     if body_preview:
         message += f": {body_preview}"
-    if status_code == 429:
+    if status_code in (408, 425, 429):
         # The endpoint is alive and explicitly throttling us. Retry it, but do
         # not treat it as an infrastructure outage for the circuit breaker.
         return RetryableAPIError(message, circuit_failure=False)
     if 500 <= status_code <= 599:
         return RetryableAPIError(message, circuit_failure=True)
-    if status_code in (401, 403, 404):
+    if status_code in (400, 401, 403, 404, 405, 422):
         return NonRetryableAPIError(message)
     return APIError(message)
 
@@ -657,7 +685,7 @@ def compute_backoff_delay(
     return max(jittered, retry_after)
 
 
-def safe_body_preview(text: str, limit: int = 300) -> str:
+def safe_body_preview(text: str, limit: int = MAX_BODY_PREVIEW) -> str:
     compact = " ".join(text.split())
     return compact[:limit]
 
@@ -705,7 +733,7 @@ class SyncEtherscanClient(BaseEtherscanClient):
         self.rate_limiter = SyncRateLimiter(config.rate_limit_delay)
         self.session = requests.Session()
         self.session.trust_env = config.trust_env_proxy
-        self.session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
+        self.session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json", "Cache-Control": "no-cache"})
         self.proxies = (
             {"http": config.proxy, "https": config.proxy} if config.proxy else None
         )
@@ -740,6 +768,8 @@ class SyncEtherscanClient(BaseEtherscanClient):
                         delay,
                     )
                     sleep_interruptible(delay, self.shutdown_event)
+        except ShutdownRequested:
+            raise
         except Exception as exc:
             self.metrics.finish_failure(exc)
             raise
@@ -820,7 +850,7 @@ class AsyncEtherscanClient(BaseEtherscanClient):
             pool=config.connect_timeout,
         )
         self.client = httpx.AsyncClient(
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json", "Cache-Control": "no-cache"},
             timeout=timeout,
             proxy=config.proxy,
             trust_env=config.trust_env_proxy,
@@ -857,6 +887,8 @@ class AsyncEtherscanClient(BaseEtherscanClient):
                         delay,
                     )
                     await async_sleep_interruptible(delay, self.shutdown_event)
+        except ShutdownRequested:
+            raise
         except Exception as exc:
             self.metrics.finish_failure(exc)
             raise
@@ -1115,7 +1147,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RATE_LIMIT_DELAY,
         help="Minimum spacing between HTTP attempts",
     )
-    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES, help="Maximum HTTP attempts per logical request")
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="Maximum HTTP attempts per logical request",
+    )
     parser.add_argument("--backoff-base", type=float, default=DEFAULT_BACKOFF_BASE)
     parser.add_argument("--backoff-max", type=float, default=DEFAULT_BACKOFF_MAX)
     parser.add_argument("--connect-timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT)
